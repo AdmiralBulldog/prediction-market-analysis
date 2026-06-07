@@ -176,7 +176,7 @@ class PolygonClient:
             trades = self.get_trades(start, end, contract_address)
             return trades, start, end
         except Exception as e:
-            if "too large" in str(e).lower():
+            if any(p in str(e).lower() for p in ("too large", "exceed maximum block range", "block range")):
                 # Split into two halves and fetch sequentially
                 mid = (start + end) // 2
                 t1, _, _ = self._fetch_chunk(start, mid, contract_address)

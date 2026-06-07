@@ -109,6 +109,49 @@ Each row represents an `FPMMBuy` or `FPMMSell` event from the legacy Fixed Produ
 
 **Note on legacy trade amounts:** The `amount`, `fee_amount`, and `outcome_tokens` fields are stored as strings to avoid integer overflow. Collateral amounts use 6 decimals (for USDC markets), while outcome tokens use 18 decimals.
 
+## Polymarket F1 Data API Trades
+
+Located under `data/polymarket/f1/trades/`. Each row represents a trade fetched from
+the Polymarket Data API (`GET /trades?market=<conditionId>`) for markets discovered via
+the Gamma `tag_slug=f1` events endpoint, rather than decoded from the blockchain. The
+companion markets table lives at `data/polymarket/f1/markets/` and uses the same schema
+as [Polymarket Markets](#polymarket-markets).
+
+The four `*_asset_id` / `*_amount` columns are **synthesized** so the
+`polymarket_win_rate_by_price` and `polymarket_calibration_by_bucket` analyses (and their
+F1 subclasses `f1_win_rate_by_price` / `f1_calibration_by_bucket`) run over this data
+unmodified — those analyses derive price purely from these columns joined to the markets
+resolution table and never read `block_number`.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `proxyWallet` | string | Trader's proxy wallet address |
+| `side` | string | `BUY` or `SELL` |
+| `asset` | string | CLOB token id of the outcome traded |
+| `conditionId` | string | Market condition id (hex hash) |
+| `size` | float | Number of outcome shares traded |
+| `price` | float | Trade price (0-1 decimal probability) |
+| `timestamp` | int | Unix timestamp of the trade |
+| `outcome` | string | Outcome name (e.g. `Yes`) |
+| `outcomeIndex` | int | Index of the outcome traded |
+| `slug` | string | Market URL slug |
+| `eventSlug` | string | Parent event URL slug |
+| `title` | string | Market title |
+| `transactionHash` | string | Blockchain transaction hash |
+| `maker_asset_id` | string | Synthesized; always `"0"` (USDC) |
+| `taker_asset_id` | string | Synthesized; `str(asset)` (the outcome token id) |
+| `taker_amount` | int | Synthesized; `round(size * 1e6)` |
+| `maker_amount` | int | Synthesized; `round(price * size * 1e6)` |
+| `_fetched_at` | datetime | When this record was fetched |
+
+By construction `100 * maker_amount / taker_amount ≈ price * 100`, matching the price
+formula the analyses apply to blockchain trades.
+
+**Partial-reuse note:** the time-series analyses (`polymarket_volume_over_time`,
+`polymarket_trades_over_time`) require `block_number` and the blocks join, so they do
+**not** apply to this output. The Data API provides a real per-trade `timestamp`, so
+bespoke F1 time-series could be built from that if needed.
+
 ## Polymarket FPMM Collateral Lookup
 
 Located at `data/polymarket/fpmm_collateral_lookup.json`, this file maps FPMM contract addresses to their collateral token information. Used to filter legacy trades to only include USDC-collateralized markets.
