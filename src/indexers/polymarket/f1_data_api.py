@@ -1,13 +1,19 @@
-"""Indexer for Polymarket F1 trades via the Data API (not the blockchain).
+"""Tag-scoped Polymarket trade fetching via the Data API (not the blockchain).
 
-Discovers F1 markets through the Gamma `tag_slug=f1` events endpoint, then fetches
-trades per market from the Data API (`/trades?market=<conditionId>`). Trades are
-written with both their native Data API fields and synthesized
+Markets for a Gamma tag (e.g. `f1`) are discovered via the events endpoint, then
+trades are fetched per market from the Data API (`/trades?market=<conditionId>`).
+Trades are written with both their native Data API fields and synthesized
 `maker_asset_id`/`taker_asset_id`/`maker_amount`/`taker_amount` columns so the
 existing Polymarket calibration analyses run over the output unmodified.
+
+`discover_markets` is shared with the blockchain-based filtered indexer
+(`chain_filtered_trades.py`) and the Part 2 CLOB recorder.
+
+To scope a new tag, add a thin subclass of `TagDataApiTradesIndexer` (see
+`PolymarketF1TradesIndexer`).
 """
 
-from dataclasses import asdict
+from abc import abstractmethod
 from datetime import datetime
 from pathlib import Path
 from typing import Union
@@ -22,26 +28,34 @@ from src.indexers.polymarket.models import Market
 GAMMA_API_URL = "https://gamma-api.polymarket.com"
 DATA_API_URL = "https://data-api.polymarket.com"
 
-MARKETS_DIR = Path("data/polymarket/f1/markets")
-TRADES_DIR = Path("data/polymarket/f1/trades")
-CURSOR_FILE = Path("data/polymarket/f1/.f1_trades_cursor")
-
 BATCH_SIZE = 10000
 
+# The Data API rejects `offset` beyond this value with a 400
+# ("max historical activity offset of 3000 exceeded") and ignores time-range
+# params, so each market is limited to roughly the most recent MAX_OFFSET +
+# page-size trades. Use the blockchain indexer for complete history.
+MAX_OFFSET = 3000
 
-def discover_f1_markets(http: HttpClient, active_only: bool = False) -> list[Market]:
-    """Discover F1 markets via Gamma `GET /events?tag_slug=f1`.
+
+def tag_data_dir(tag_slug: str) -> Path:
+    """Root data directory for a tag, e.g. `data/polymarket/f1`."""
+    return Path("data/polymarket") / tag_slug
+
+
+def discover_markets(http: HttpClient, tag_slug: str, active_only: bool = False) -> list[Market]:
+    """Discover markets for a Gamma tag via `GET /events?tag_slug=<slug>`.
 
     Paginates events (open and closed), expands the nested `markets[]` of each
     event into `Market` objects, and dedupes by `condition_id`.
 
     Args:
         http: Shared HTTP client.
+        tag_slug: Gamma tag slug, e.g. `f1` or `elections`.
         active_only: If True, keep only active, non-closed markets (used by the
             live CLOB recorder in Part 2 to avoid dead books).
 
     Returns:
-        Deduplicated list of F1 `Market` objects.
+        Deduplicated list of `Market` objects for the tag.
     """
     markets: dict[str, Market] = {}
     offset = 0
@@ -50,7 +64,7 @@ def discover_f1_markets(http: HttpClient, active_only: bool = False) -> list[Mar
     while True:
         data: Union[dict, list] = http.get(
             f"{GAMMA_API_URL}/events",
-            params={"tag_slug": "f1", "limit": limit, "offset": offset},
+            params={"tag_slug": tag_slug, "limit": limit, "offset": offset},
         )
         events = data if isinstance(data, list) else data.get("data", data)
         if not events:
@@ -72,45 +86,60 @@ def discover_f1_markets(http: HttpClient, active_only: bool = False) -> list[Mar
     return list(markets.values())
 
 
-class PolymarketF1TradesIndexer(Indexer):
-    """Fetches F1 trades from the Polymarket Data API into parquet files."""
+def discover_f1_markets(http: HttpClient, active_only: bool = False) -> list[Market]:
+    """Convenience wrapper for `discover_markets(http, "f1", ...)`."""
+    return discover_markets(http, "f1", active_only)
 
-    def __init__(self):
-        super().__init__(
-            name="polymarket_f1_trades",
-            description="Fetches F1 trades via the Polymarket Data API to parquet files",
-        )
+
+def write_markets(markets: list[Market], markets_dir: Path) -> None:
+    """Write the tag's markets table (resolution source for the analyses)."""
+    from dataclasses import asdict
+
+    markets_dir.mkdir(parents=True, exist_ok=True)
+    fetched_at = datetime.utcnow()
+    records = []
+    for market in markets:
+        record = asdict(market)
+        record["_fetched_at"] = fetched_at
+        records.append(record)
+    path = markets_dir / "markets.parquet"
+    pd.DataFrame(records).to_parquet(path)
+    print(f"Saved {len(records)} markets to {path}")
+
+
+class TagDataApiTradesIndexer(Indexer):
+    """Base indexer: fetch a tag's trades from the Polymarket Data API.
+
+    Concrete subclasses set the `tag_slug` class attribute (which makes them
+    non-abstract and therefore discoverable by the `index` menu).
+    """
+
+    @property
+    @abstractmethod
+    def tag_slug(self) -> str:
+        """Gamma tag slug this indexer scopes to."""
+
+    def __init__(self, name: str, description: str):
+        super().__init__(name=name, description=description)
         self.http = HttpClient(rate_limit=10)
+        base = tag_data_dir(self.tag_slug)
+        self.markets_dir = base / "markets"
+        self.trades_dir = base / "trades"
+        self.cursor_file = base / ".data_api_trades_cursor"
 
     def run(self) -> None:
-        MARKETS_DIR.mkdir(parents=True, exist_ok=True)
-        TRADES_DIR.mkdir(parents=True, exist_ok=True)
-        CURSOR_FILE.parent.mkdir(parents=True, exist_ok=True)
+        self.trades_dir.mkdir(parents=True, exist_ok=True)
+        self.cursor_file.parent.mkdir(parents=True, exist_ok=True)
 
         try:
-            # Step 1: discover F1 markets.
-            print("Discovering F1 markets via Gamma...")
-            markets = discover_f1_markets(self.http)
-            print(f"Found {len(markets)} F1 markets")
+            print(f"Discovering '{self.tag_slug}' markets via Gamma...")
+            markets = discover_markets(self.http, self.tag_slug)
+            print(f"Found {len(markets)} markets")
 
-            # Step 2: write F1 markets table (resolution source for analyses).
-            self._write_markets(markets)
-
-            # Step 3 + 4: fetch trades per market and write in batches.
+            write_markets(markets, self.markets_dir)
             self._fetch_trades(markets)
         finally:
             self.http.close()
-
-    def _write_markets(self, markets: list[Market]) -> None:
-        fetched_at = datetime.utcnow()
-        records = []
-        for market in markets:
-            record = asdict(market)
-            record["_fetched_at"] = fetched_at
-            records.append(record)
-        path = MARKETS_DIR / "markets_f1.parquet"
-        pd.DataFrame(records).to_parquet(path)
-        print(f"Saved {len(records)} markets to {path}")
 
     def _fetch_trades(self, markets: list[Market]) -> None:
         done = self._load_cursor()
@@ -122,32 +151,19 @@ class PolymarketF1TradesIndexer(Indexer):
         total_saved = 0
         interrupted = False
 
-        def get_next_chunk_idx() -> int:
-            existing = list(TRADES_DIR.glob("trades_*.parquet"))
-            indices = []
-            for f in existing:
-                parts = f.stem.split("_")
-                if len(parts) >= 2:
-                    try:
-                        indices.append(int(parts[1]))
-                    except ValueError:
-                        pass
-            return max(indices) + BATCH_SIZE if indices else 0
-
         def save_batch(batch: list[dict]) -> None:
             nonlocal total_saved
             if not batch:
                 return
-            chunk_idx = get_next_chunk_idx()
-            path = TRADES_DIR / f"trades_{chunk_idx}_{chunk_idx + BATCH_SIZE}.parquet"
+            chunk_idx = self._next_chunk_idx()
+            path = self.trades_dir / f"trades_{chunk_idx}_{chunk_idx + BATCH_SIZE}.parquet"
             pd.DataFrame(batch).to_parquet(path)
             total_saved += len(batch)
             tqdm.write(f"Saved {len(batch)} trades to {path.name}")
 
         try:
-            for market in tqdm(pending, desc="Fetching F1 trades", unit=" market"):
-                for trade in self._fetch_market_trades(market.condition_id):
-                    all_trades.append(trade)
+            for market in tqdm(pending, desc=f"Fetching {self.tag_slug} trades", unit=" market"):
+                all_trades.extend(self._fetch_market_trades(market.condition_id))
 
                 while len(all_trades) >= BATCH_SIZE:
                     save_batch(all_trades[:BATCH_SIZE])
@@ -161,10 +177,10 @@ class PolymarketF1TradesIndexer(Indexer):
         if all_trades:
             save_batch(all_trades)
 
-        if not interrupted and CURSOR_FILE.exists():
-            CURSOR_FILE.unlink()
+        if not interrupted and self.cursor_file.exists():
+            self.cursor_file.unlink()
 
-        print(f"\nDone: {total_saved} F1 trades saved")
+        print(f"\nDone: {total_saved} {self.tag_slug} trades saved")
 
     def _fetch_market_trades(self, condition_id: str) -> list[dict]:
         fetched_at = datetime.utcnow()
@@ -186,7 +202,13 @@ class PolymarketF1TradesIndexer(Indexer):
 
             if len(trades) < limit:
                 break
+
             offset += len(trades)
+            if offset > MAX_OFFSET:
+                tqdm.write(
+                    f"Truncated {condition_id} at {len(rows)} trades (Data API offset cap of {MAX_OFFSET} reached)"
+                )
+                break
 
         return rows
 
@@ -220,13 +242,37 @@ class PolymarketF1TradesIndexer(Indexer):
             "_fetched_at": fetched_at,
         }
 
-    @staticmethod
-    def _load_cursor() -> set[str]:
-        if not CURSOR_FILE.exists():
-            return set()
-        return {line.strip() for line in CURSOR_FILE.read_text().splitlines() if line.strip()}
+    def _next_chunk_idx(self) -> int:
+        existing = list(self.trades_dir.glob("trades_*.parquet"))
+        indices = []
+        for f in existing:
+            parts = f.stem.split("_")
+            if len(parts) >= 2:
+                try:
+                    indices.append(int(parts[1]))
+                except ValueError:
+                    pass
+        return max(indices) + BATCH_SIZE if indices else 0
 
-    @staticmethod
-    def _append_cursor(condition_id: str) -> None:
-        with CURSOR_FILE.open("a") as f:
+    def _load_cursor(self) -> set[str]:
+        if not self.cursor_file.exists():
+            return set()
+        return {line.strip() for line in self.cursor_file.read_text().splitlines() if line.strip()}
+
+    def _append_cursor(self, condition_id: str) -> None:
+        with self.cursor_file.open("a") as f:
             f.write(f"{condition_id}\n")
+
+
+class PolymarketF1TradesIndexer(TagDataApiTradesIndexer):
+    """Fetches F1 trades from the Polymarket Data API into parquet files."""
+
+    @property
+    def tag_slug(self) -> str:
+        return "f1"
+
+    def __init__(self):
+        super().__init__(
+            name="polymarket_f1_trades",
+            description="Fetches F1 trades via the Polymarket Data API to parquet files",
+        )

@@ -147,6 +147,24 @@ resolution table and never read `block_number`.
 By construction `100 * maker_amount / taker_amount ≈ price * 100`, matching the price
 formula the analyses apply to blockchain trades.
 
+This layout is tag-scoped: the same `data/polymarket/<tag>/` structure is used for any
+Gamma tag (e.g. `f1`, `elections`), populated by the `TagDataApiTradesIndexer`
+subclasses.
+
+**Per-market trade cap:** the Data API rejects `offset` values above 3000
+(`max historical activity offset of 3000 exceeded`) and ignores time-range
+parameters, so only roughly the **most recent ~3500 trades** of each market are
+retrievable this way. Markets exceeding that are truncated (the indexer logs a
+warning).
+
+**Blockchain alternative:** the same `data/polymarket/<tag>/trades/` location can instead
+be populated from the Polygon blockchain by the `TagFilteredChainTradesIndexer`
+subclasses (e.g. `polymarket_f1_chain_trades`). That path returns complete history with
+no per-market cap, but writes the standard [Polymarket Trades](#polymarket-trades) column
+set (with `block_number`, `transaction_hash`, etc.) rather than the synthesized Data API
+columns. Use only one method per tag; the column sets differ, so delete the tag's
+`trades/` directory before switching methods.
+
 **Partial-reuse note:** the time-series analyses (`polymarket_volume_over_time`,
 `polymarket_trades_over_time`) require `block_number` and the blocks join, so they do
 **not** apply to this output. The Data API provides a real per-trade `timestamp`, so
