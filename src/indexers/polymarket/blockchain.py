@@ -2,6 +2,7 @@
 
 import concurrent.futures
 import os
+import time
 from collections.abc import Generator
 from dataclasses import dataclass
 from typing import Optional
@@ -104,6 +105,11 @@ class PolygonClient:
 
     def __init__(self, rpc_url: Optional[str] = None):
         self.rpc_url = rpc_url or POLYGON_RPC
+        if not self.rpc_url:
+            raise RuntimeError(
+                "POLYGON_RPC is not set. Copy .env.example to .env and set POLYGON_RPC "
+                "to a Polygon archive RPC URL (e.g. from Alchemy or QuickNode)."
+            )
         self.w3 = Web3(Web3.HTTPProvider(self.rpc_url, request_kwargs={"timeout": 30}))
         self.w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
 
@@ -170,7 +176,9 @@ class PolygonClient:
 
         return trades
 
-    def _fetch_chunk(self, start: int, end: int, contract_address: str) -> tuple[list[BlockchainTrade], int, int]:
+    def _fetch_chunk(
+        self, start: int, end: int, contract_address: str, attempt: int = 0
+    ) -> tuple[list[BlockchainTrade], int, int]:
         """Fetch a single chunk of trades. Used by thread pool."""
         try:
             trades = self.get_trades(start, end, contract_address)
@@ -182,6 +190,9 @@ class PolygonClient:
                 t1, _, _ = self._fetch_chunk(start, mid, contract_address)
                 t2, _, _ = self._fetch_chunk(mid + 1, end, contract_address)
                 return t1 + t2, start, end
+            elif attempt < 3:
+                time.sleep(2**attempt)
+                return self._fetch_chunk(start, end, contract_address, attempt + 1)
             else:
                 print(f"Error fetching blocks {start}-{end}: {e}")
                 return [], start, end
