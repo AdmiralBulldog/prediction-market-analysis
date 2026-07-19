@@ -132,6 +132,40 @@ make analyze
 
 This opens an interactive menu to select which analysis to run. You can run all analyses or select a specific one. Output files (PNG, PDF, CSV, JSON) are saved to `output/`.
 
+#### F1 trade analysis (`analysis/`)
+
+Reusable, self-contained DuckDB queries (`analysis/queries/*.sql`) that read the F1
+trades parquet directly.
+
+Print result rows in the terminal with the DuckDB CLI (no wrapper needed):
+
+```bash
+duckdb -c ".read analysis/queries/gap_distribution.sql"
+duckdb -c ".read analysis/queries/trades_per_timestamp.sql" | head -50
+```
+
+Render an interactive Plotly chart to `output/<query>.html`:
+
+```bash
+python analysis/plot.py analysis/queries/gap_distribution.sql
+python analysis/plot.py analysis/queries/trades_per_timestamp.sql --chart line
+```
+
+To analyze other data or columns, add a new `.sql` file (or pass `--x` / `--y` to `plot.py`).
+
+##### Viewing the HTML plots (GitHub Codespaces)
+
+Serve the `output/` folder and open it via Codespaces port forwarding:
+
+```bash
+python -m http.server 8000 --bind 127.0.0.1 --directory output
+```
+
+When the port-forward toast appears click **Open in Browser**, or use the **Ports**
+tab (port `8000` → globe icon). Then open e.g. `http://localhost:8000/gap_distribution.html`.
+Any new plot written to `output/` is viewable by refreshing the listing. Stop the
+server with `Ctrl+C`.
+
 ### Packaging Data
 
 To compress the data directory for storage/distribution:
